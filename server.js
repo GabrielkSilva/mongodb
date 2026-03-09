@@ -32,6 +32,10 @@ function parsePagination(query) {
     };
 }
 
+app.get('/', (req, res) => {
+    res.json({ status: 'ok', service: 'escolinha-api', uptime: process.uptime() });
+});
+
 app.get('/getUserTickets', async (req, res) => {
     try {
         const db = await getDb();
