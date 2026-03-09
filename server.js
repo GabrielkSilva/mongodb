@@ -17,6 +17,84 @@ async function getDb() {
     return cachedClient.db('escolinha');
 }
 
+const memCache = new Map();
+const collectionKeys = new Map();
+
+function invalidateCollection(colName) {
+    const keys = collectionKeys.get(colName);
+    if (!keys) return;
+    for (const key of keys) memCache.delete(key);
+    collectionKeys.delete(colName);
+}
+
+function withCache(...collections) {
+    return (req, res, next) => {
+        const key = req.originalUrl;
+        if (memCache.has(key)) return res.json(memCache.get(key));
+
+        const originalJson = res.json.bind(res);
+        res.json = (data) => {
+            memCache.set(key, data);
+            for (const col of collections) {
+                if (!collectionKeys.has(col)) collectionKeys.set(col, new Set());
+                collectionKeys.get(col).add(key);
+            }
+            return originalJson(data);
+        };
+        next();
+    };
+}
+
+async function setupChangeStreams() {
+    const db = await getDb();
+    const watchList = [
+        { name: 'event_tickets', also: ['event_tickets', 'profiles'] },
+        { name: 'profiles', also: ['profiles', 'event_tickets'] },
+        { name: 'sorteio_settings', also: ['sorteio_settings'] },
+        { name: 'raffle_winners', also: ['raffle_winners'] },
+        { name: 'estrela_logs', also: ['estrela_logs'] },
+        { name: 'cantina_logs', also: ['cantina_logs'] },
+        { name: 'logs', also: ['logs'] },
+    ];
+
+    for (const { name, also } of watchList) {
+        try {
+            const stream = db.collection(name).watch([], { fullDocument: 'default' });
+
+            stream.on('change', () => {
+                for (const col of also) invalidateCollection(col);
+                console.log(`♻️ Cache invalidado: ${name}`);
+            });
+
+            stream.on('error', (err) => {
+                console.error(`⚠️ Change stream erro (${name}):`, err.message);
+                setTimeout(() => setupSingleStream(db, name, also), 5000);
+            });
+        } catch (err) {
+            console.error(`❌ Falha ao criar change stream para ${name}:`, err.message);
+        }
+    }
+
+    console.log('👁️ Change Streams ativos para todas as coleções');
+}
+
+function setupSingleStream(db, name, also) {
+    try {
+        const stream = db.collection(name).watch([], { fullDocument: 'default' });
+        stream.on('change', () => {
+            for (const col of also) invalidateCollection(col);
+            console.log(`♻️ Cache invalidado: ${name}`);
+        });
+        stream.on('error', (err) => {
+            console.error(`⚠️ Reconexão change stream (${name}):`, err.message);
+            setTimeout(() => setupSingleStream(db, name, also), 5000);
+        });
+        console.log(`🔄 Change stream reconectado: ${name}`);
+    } catch (err) {
+        console.error(`❌ Falha reconexão (${name}):`, err.message);
+    }
+}
+
 function esc(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -26,17 +104,29 @@ function nicknameFilter(nickname) {
 }
 
 function parsePagination(query) {
+    const hasLimit = query.limit !== undefined && query.limit !== null && query.limit !== '';
     return {
-        limit: Math.min(parseInt(query.limit) || 20, 100),
+        limit: hasLimit ? Math.min(parseInt(query.limit), 100) : 0,
         skip: Math.max(parseInt(query.skip) || 0, 0),
     };
 }
 
+function applyPagination(cursor, { skip, limit }) {
+    let q = cursor.skip(skip);
+    if (limit > 0) q = q.limit(limit);
+    return q;
+}
+
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', service: 'escolinha-api', uptime: process.uptime() });
+    res.json({
+        status: 'ok',
+        service: 'escolinha-api',
+        uptime: process.uptime(),
+        cacheEntries: memCache.size
+    });
 });
 
-app.get('/getUserTickets', async (req, res) => {
+app.get('/getUserTickets', withCache('event_tickets', 'profiles'), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname } = req.query;
@@ -75,7 +165,7 @@ app.get('/getUserTickets', async (req, res) => {
     }
 });
 
-app.get('/get-sorteio-status', async (req, res) => {
+app.get('/get-sorteio-status', withCache('sorteio_settings'), async (req, res) => {
     try {
         const db = await getDb();
         const statusDoc = await db.collection('sorteio_settings').findOne({ type: 'semanal_status' });
@@ -108,13 +198,16 @@ app.get('/get-sorteio-status', async (req, res) => {
     }
 });
 
-app.get('/get-raffle-winners', async (req, res) => {
+app.get('/get-raffle-winners', withCache('raffle_winners'), async (req, res) => {
     try {
         const db = await getDb();
-        const { limit, skip } = parsePagination(req.query);
+        const pag = parsePagination(req.query);
+
+        let query = db.collection('raffle_winners').find({}).sort({ created_at: -1 });
+        query = applyPagination(query, pag);
 
         const [data, total] = await Promise.all([
-            db.collection('raffle_winners').find({}).sort({ created_at: -1 }).skip(skip).limit(limit).toArray(),
+            query.toArray(),
             db.collection('raffle_winners').countDocuments({})
         ]);
 
@@ -124,18 +217,21 @@ app.get('/get-raffle-winners', async (req, res) => {
     }
 });
 
-app.get('/get-event-tickets', async (req, res) => {
+app.get('/get-event-tickets', withCache('event_tickets'), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname, type, mode, stats: wantStats } = req.query;
-        const { limit, skip } = parsePagination(req.query);
+        const pag = parsePagination(req.query);
         const col = db.collection('event_tickets');
         const needsStats = wantStats === 'true' || (!nickname && (mode === 'list' || mode === 'ranking' || !mode));
 
         if (nickname) {
             const filter = { nickname: nicknameFilter(nickname) };
+            let query = col.find(filter).skip(pag.skip);
+            if (pag.limit > 0) query = query.limit(pag.limit);
+
             const [data, total] = await Promise.all([
-                col.find(filter).skip(skip).limit(limit).toArray(),
+                query.toArray(),
                 col.countDocuments(filter)
             ]);
             return res.json({ data, total, stats: null });
@@ -198,11 +294,11 @@ app.get('/get-event-tickets', async (req, res) => {
     }
 });
 
-app.get('/get-estrela-logs', async (req, res) => {
+app.get('/get-estrela-logs', withCache('estrela_logs'), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname, search } = req.query;
-        const { limit, skip } = parsePagination(req.query);
+        const pag = parsePagination(req.query);
         const col = db.collection('estrela_logs');
 
         const filter = {};
@@ -214,8 +310,11 @@ app.get('/get-estrela-logs', async (req, res) => {
             ];
         }
 
+        let query = col.find(filter).sort({ created_at: -1 });
+        query = applyPagination(query, pag);
+
         const [data, total, statsAgg] = await Promise.all([
-            col.find(filter).sort({ created_at: -1 }).skip(skip).limit(limit).toArray(),
+            query.toArray(),
             col.countDocuments(filter),
             col.aggregate([
                 { $match: filter },
@@ -228,17 +327,17 @@ app.get('/get-estrela-logs', async (req, res) => {
             if (stats.hasOwnProperty(s._id)) stats[s._id] = s.count;
         });
 
-        res.json({ data, total, limit, skip, stats });
+        res.json({ data, total, limit: pag.limit, skip: pag.skip, stats });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-app.get('/get-cantina-logs', async (req, res) => {
+app.get('/get-cantina-logs', withCache('cantina_logs'), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname, search, type, month, year } = req.query;
-        const { limit, skip } = parsePagination(req.query);
+        const pag = parsePagination(req.query);
         const col = db.collection('cantina_logs');
 
         const filter = {};
@@ -271,8 +370,11 @@ app.get('/get-cantina-logs', async (req, res) => {
             }
         }
 
+        let query = col.find(filter).sort({ created_at: -1 });
+        query = applyPagination(query, pag);
+
         const [data, total, statsAgg] = await Promise.all([
-            col.find(filter).sort({ created_at: -1 }).skip(skip).limit(limit).toArray(),
+            query.toArray(),
             col.countDocuments(filter),
             col.aggregate([
                 { $match: filter },
@@ -295,17 +397,17 @@ app.get('/get-cantina-logs', async (req, res) => {
             pointsRemoved: statsAgg[0]?.pointsRemoved || 0
         };
 
-        res.json({ data, total, limit, skip, stats });
+        res.json({ data, total, limit: pag.limit, skip: pag.skip, stats });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-app.get('/get-logs', async (req, res) => {
+app.get('/get-logs', withCache('logs'), async (req, res) => {
     try {
         const db = await getDb();
         const { aula_name, search } = req.query;
-        const { limit, skip } = parsePagination(req.query);
+        const pag = parsePagination(req.query);
         const col = db.collection('logs');
 
         const filter = {};
@@ -317,12 +419,15 @@ app.get('/get-logs', async (req, res) => {
             ];
         }
 
+        let query = col.find(filter).sort({ created_at: -1 });
+        query = applyPagination(query, pag);
+
         const [data, total] = await Promise.all([
-            col.find(filter).sort({ created_at: -1 }).skip(skip).limit(limit).toArray(),
+            query.toArray(),
             col.countDocuments(filter)
         ]);
 
-        res.json({ data, total, limit, skip });
+        res.json({ data, total, limit: pag.limit, skip: pag.skip });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -334,6 +439,11 @@ app.use((req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`API rodando na porta ${PORT}`);
+    try {
+        await setupChangeStreams();
+    } catch (err) {
+        console.error('⚠️ Change Streams indisponíveis, usando cache sem invalidação automática:', err.message);
+    }
 });
