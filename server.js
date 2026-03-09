@@ -18,82 +18,32 @@ async function getDb() {
 }
 
 const memCache = new Map();
-const collectionKeys = new Map();
 
-function invalidateCollection(colName) {
-    const keys = collectionKeys.get(colName);
-    if (!keys) return;
-    for (const key of keys) memCache.delete(key);
-    collectionKeys.delete(colName);
-}
-
-function withCache(...collections) {
+function withCache(ttlSeconds) {
     return (req, res, next) => {
         const key = req.originalUrl;
-        if (memCache.has(key)) return res.json(memCache.get(key));
+        const entry = memCache.get(key);
+
+        if (entry && Date.now() - entry.ts < ttlSeconds * 1000) {
+            return res.json(entry.data);
+        }
 
         const originalJson = res.json.bind(res);
         res.json = (data) => {
-            memCache.set(key, data);
-            for (const col of collections) {
-                if (!collectionKeys.has(col)) collectionKeys.set(col, new Set());
-                collectionKeys.get(col).add(key);
-            }
+            memCache.set(key, { data, ts: Date.now() });
             return originalJson(data);
         };
         next();
     };
 }
 
-async function setupChangeStreams() {
-    const db = await getDb();
-    const watchList = [
-        { name: 'event_tickets', also: ['event_tickets', 'profiles'] },
-        { name: 'profiles', also: ['profiles', 'event_tickets'] },
-        { name: 'sorteio_settings', also: ['sorteio_settings'] },
-        { name: 'raffle_winners', also: ['raffle_winners'] },
-        { name: 'estrela_logs', also: ['estrela_logs'] },
-        { name: 'cantina_logs', also: ['cantina_logs'] },
-        { name: 'logs', also: ['logs'] },
-    ];
-
-    for (const { name, also } of watchList) {
-        try {
-            const stream = db.collection(name).watch([], { fullDocument: 'default' });
-
-            stream.on('change', () => {
-                for (const col of also) invalidateCollection(col);
-                console.log(`♻️ Cache invalidado: ${name}`);
-            });
-
-            stream.on('error', (err) => {
-                console.error(`⚠️ Change stream erro (${name}):`, err.message);
-                setTimeout(() => setupSingleStream(db, name, also), 5000);
-            });
-        } catch (err) {
-            console.error(`❌ Falha ao criar change stream para ${name}:`, err.message);
-        }
+setInterval(() => {
+    const now = Date.now();
+    const maxAge = 10 * 60 * 1000;
+    for (const [key, entry] of memCache) {
+        if (now - entry.ts > maxAge) memCache.delete(key);
     }
-
-    console.log('👁️ Change Streams ativos para todas as coleções');
-}
-
-function setupSingleStream(db, name, also) {
-    try {
-        const stream = db.collection(name).watch([], { fullDocument: 'default' });
-        stream.on('change', () => {
-            for (const col of also) invalidateCollection(col);
-            console.log(`♻️ Cache invalidado: ${name}`);
-        });
-        stream.on('error', (err) => {
-            console.error(`⚠️ Reconexão change stream (${name}):`, err.message);
-            setTimeout(() => setupSingleStream(db, name, also), 5000);
-        });
-        console.log(`🔄 Change stream reconectado: ${name}`);
-    } catch (err) {
-        console.error(`❌ Falha reconexão (${name}):`, err.message);
-    }
-}
+}, 60 * 1000);
 
 function esc(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -126,7 +76,7 @@ app.get('/', (req, res) => {
     });
 });
 
-app.get('/getUserTickets', withCache('event_tickets', 'profiles'), async (req, res) => {
+app.get('/getUserTickets', withCache(30), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname } = req.query;
@@ -165,7 +115,7 @@ app.get('/getUserTickets', withCache('event_tickets', 'profiles'), async (req, r
     }
 });
 
-app.get('/get-sorteio-status', withCache('sorteio_settings'), async (req, res) => {
+app.get('/get-sorteio-status', withCache(60), async (req, res) => {
     try {
         const db = await getDb();
         const statusDoc = await db.collection('sorteio_settings').findOne({ type: 'semanal_status' });
@@ -198,7 +148,7 @@ app.get('/get-sorteio-status', withCache('sorteio_settings'), async (req, res) =
     }
 });
 
-app.get('/get-raffle-winners', withCache('raffle_winners'), async (req, res) => {
+app.get('/get-raffle-winners', withCache(30), async (req, res) => {
     try {
         const db = await getDb();
         const pag = parsePagination(req.query);
@@ -217,7 +167,7 @@ app.get('/get-raffle-winners', withCache('raffle_winners'), async (req, res) => 
     }
 });
 
-app.get('/get-event-tickets', withCache('event_tickets'), async (req, res) => {
+app.get('/get-event-tickets', withCache(30), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname, type, mode, stats: wantStats } = req.query;
@@ -294,7 +244,7 @@ app.get('/get-event-tickets', withCache('event_tickets'), async (req, res) => {
     }
 });
 
-app.get('/get-estrela-logs', withCache('estrela_logs'), async (req, res) => {
+app.get('/get-estrela-logs', withCache(60), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname, search } = req.query;
@@ -333,7 +283,7 @@ app.get('/get-estrela-logs', withCache('estrela_logs'), async (req, res) => {
     }
 });
 
-app.get('/get-cantina-logs', withCache('cantina_logs'), async (req, res) => {
+app.get('/get-cantina-logs', withCache(60), async (req, res) => {
     try {
         const db = await getDb();
         const { nickname, search, type, month, year } = req.query;
@@ -354,19 +304,21 @@ app.get('/get-cantina-logs', withCache('cantina_logs'), async (req, res) => {
             const targetMonth = month && month !== 'todos' ? parseInt(month) : null;
             const targetYear = year ? parseInt(year) : null;
 
-            if (targetYear !== null && targetMonth !== null) {
-                const start = new Date(targetYear, targetMonth, 1);
-                const end = new Date(targetYear, targetMonth + 1, 1);
-                filter.created_at = { $gte: start.toISOString(), $lt: end.toISOString() };
-            } else if (targetYear !== null) {
-                const start = new Date(targetYear, 0, 1);
-                const end = new Date(targetYear + 1, 0, 1);
-                filter.created_at = { $gte: start.toISOString(), $lt: end.toISOString() };
-            } else if (targetMonth !== null) {
+            if (targetYear !== null && !isNaN(targetYear)) {
+                let start, end;
+                if (targetMonth !== null && !isNaN(targetMonth)) {
+                    start = new Date(targetYear, targetMonth, 1);
+                    end = new Date(targetYear, targetMonth + 1, 1);
+                } else {
+                    start = new Date(targetYear, 0, 1);
+                    end = new Date(targetYear + 1, 0, 1);
+                }
+                filter.created_at = { $gte: start, $lt: end };
+            } else if (targetMonth !== null && !isNaN(targetMonth)) {
                 const currentYear = new Date().getFullYear();
                 const start = new Date(currentYear, targetMonth, 1);
                 const end = new Date(currentYear, targetMonth + 1, 1);
-                filter.created_at = { $gte: start.toISOString(), $lt: end.toISOString() };
+                filter.created_at = { $gte: start, $lt: end };
             }
         }
 
@@ -403,7 +355,7 @@ app.get('/get-cantina-logs', withCache('cantina_logs'), async (req, res) => {
     }
 });
 
-app.get('/get-logs', withCache('logs'), async (req, res) => {
+app.get('/get-logs', withCache(60), async (req, res) => {
     try {
         const db = await getDb();
         const { aula_name, search } = req.query;
@@ -439,11 +391,6 @@ app.use((req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
     console.log(`API rodando na porta ${PORT}`);
-    try {
-        await setupChangeStreams();
-    } catch (err) {
-        console.error('⚠️ Change Streams indisponíveis, usando cache sem invalidação automática:', err.message);
-    }
 });
