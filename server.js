@@ -420,6 +420,29 @@ app.get('/get-log-callers', withCache(60), async (req, res) => {
     }
 });
 
+app.get('/twitch/:nickname', withCache(60), async (req, res) => {
+    try {
+        const db = await getDb();
+        const nickname = req.params.nickname;
+        const pag = parsePagination(req.query);
+        const col = db.collection('cantina_pontos_history');
+
+        const filter = { nickname: { $regex: esc(nickname), $options: 'i' } };
+
+        let query = col.find(filter).sort({ created_at: -1 });
+        query = applyPagination(query, pag);
+
+        const [data, total] = await Promise.all([
+            query.toArray(),
+            col.countDocuments(filter)
+        ]);
+
+        res.json({ data, total, limit: pag.limit, skip: pag.skip });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.use((req, res) => {
     res.status(404).json({ error: 'Rota não encontrada' });
 });
