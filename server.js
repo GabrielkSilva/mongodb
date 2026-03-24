@@ -425,9 +425,12 @@ app.get('/twitch/:nickname', withCache(60), async (req, res) => {
         const db = await getDb();
         const nickname = req.params.nickname;
         const pag = parsePagination(req.query);
-        const col = db.collection('cantina_pontos_history');
+        const col = db.collection('cantina_logs');
 
-        const filter = { nickname: { $regex: esc(nickname), $options: 'i' } };
+        const filter = { 
+            nickname: { $regex: esc(nickname), $options: 'i' },
+            type: 'twitch_watch_time'
+        };
 
         let query = col.find(filter).sort({ created_at: -1 });
         query = applyPagination(query, pag);
