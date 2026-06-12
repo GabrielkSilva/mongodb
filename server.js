@@ -446,6 +446,113 @@ app.get('/twitch/:nickname', withCache(60), async (req, res) => {
     }
 });
 
+app.get('/odds/events', withCache(10), async (req, res) => {
+    try {
+        const db = await getDb();
+        const events = await db.collection('odds_events')
+            .find({})
+            .sort({ created_at: -1 })
+            .toArray();
+        res.json({ data: events });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/odds/my-bets', withCache(10), async (req, res) => {
+    try {
+        const db = await getDb();
+        const { nickname } = req.query;
+        if (!nickname) return res.status(400).json({ error: 'Nickname é obrigatório' });
+
+        const bets = await db.collection('odds_bets').aggregate([
+            { $match: { nickname: nicknameFilter(nickname) } },
+            {
+                $addFields: {
+                    event_obj_id: {
+                        $cond: {
+                            if: { $eq: [{ $type: '$event_id' }, 'string'] },
+                            then: { $toObjectId: '$event_id' },
+                            else: '$event_id'
+                        }
+                    }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'odds_events',
+                    localField: 'event_obj_id',
+                    foreignField: '_id',
+                    as: 'event'
+                }
+            },
+            { $unwind: { path: '$event', preserveNullAndEmptyArrays: true } },
+            { $sort: { created_at: -1 } }
+        ]).toArray();
+
+        res.json({ data: bets });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/odds/admin/dashboard', withCache(5), async (req, res) => {
+    try {
+        const db = await getDb();
+        const [events, betsSummary, betsList] = await Promise.all([
+            db.collection('odds_events').find({}).toArray(),
+            db.collection('odds_bets').aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalPool: { $sum: '$amount' },
+                        totalPayout: { $sum: '$payout' },
+                        totalBets: { $sum: 1 }
+                    }
+                }
+            ]).toArray(),
+            db.collection('odds_bets').aggregate([
+                {
+                    $addFields: {
+                        event_obj_id: {
+                            $cond: {
+                                if: { $eq: [{ $type: '$event_id' }, 'string'] },
+                                then: { $toObjectId: '$event_id' },
+                                else: '$event_id'
+                            }
+                        }
+                    }
+                },
+                {
+                    $lookup: {
+                        from: 'odds_events',
+                        localField: 'event_obj_id',
+                        foreignField: '_id',
+                        as: 'event'
+                    }
+                },
+                { $unwind: { path: '$event', preserveNullAndEmptyArrays: true } },
+                { $sort: { created_at: -1 } },
+                { $limit: 100 }
+            ]).toArray()
+        ]);
+
+        const summary = betsSummary[0] || { totalPool: 0, totalPayout: 0, totalBets: 0 };
+        const totalBurnt = summary.totalPool * 0.05;
+
+        res.json({
+            total_pool: summary.totalPool,
+            total_burnt: totalBurnt,
+            total_payout: summary.totalPayout,
+            total_bets: summary.totalBets,
+            events_count: events.length,
+            bets: betsList
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.use((req, res) => {
     res.status(404).json({ error: 'Rota não encontrada' });
 });
