@@ -553,6 +553,130 @@ app.get('/odds/admin/dashboard', withCache(5), async (req, res) => {
     }
 });
 
+app.get('/worldcup/standings', withCache(600), async (req, res) => {
+    try {
+        const [groupsRes, teamsRes] = await Promise.all([
+            fetch('https://worldcup26.ir/get/groups').then(r => r.json()),
+            fetch('https://worldcup26.ir/get/teams').then(r => r.json())
+        ]);
+        const teamsMap = new Map();
+        if (teamsRes && teamsRes.teams) {
+            teamsRes.teams.forEach(t => {
+                teamsMap.set(String(t.id), t);
+            });
+        }
+        const groups = (groupsRes?.groups || []).map(group => {
+            const mappedTeams = (group.teams || []).map(gt => {
+                const details = teamsMap.get(String(gt.team_id)) || {};
+                return {
+                    team_id: gt.team_id,
+                    name: details.name_en || 'Unknown',
+                    flag: details.flag || '',
+                    fifa_code: details.fifa_code || '',
+                    mp: parseInt(gt.mp) || 0,
+                    w: parseInt(gt.w) || 0,
+                    d: parseInt(gt.d) || 0,
+                    l: parseInt(gt.l) || 0,
+                    pts: parseInt(gt.pts) || 0,
+                    gf: parseInt(gt.gf) || 0,
+                    ga: parseInt(gt.ga) || 0,
+                    gd: parseInt(gt.gd) || 0
+                };
+            });
+            mappedTeams.sort((a, b) => {
+                if (b.pts !== a.pts) return b.pts - a.pts;
+                if (b.gd !== a.gd) return b.gd - a.gd;
+                return b.gf - a.gf;
+            });
+            return {
+                id: group._id,
+                name: group.name,
+                teams: mappedTeams
+            };
+        });
+        groups.sort((a, b) => a.name.localeCompare(b.name));
+        res.json({ success: true, groups });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/worldcup/matches', withCache(600), async (req, res) => {
+    try {
+        const [gamesRes, teamsRes] = await Promise.all([
+            fetch('https://worldcup26.ir/get/games').then(r => r.json()),
+            fetch('https://worldcup26.ir/get/teams').then(r => r.json())
+        ]);
+        const teamsMap = new Map();
+        if (teamsRes && teamsRes.teams) {
+            teamsRes.teams.forEach(t => {
+                teamsMap.set(String(t.id), t);
+            });
+        }
+        const offsetHours = {
+            '1': 3,
+            '2': 3,
+            '3': 3,
+            '4': 2,
+            '5': 2,
+            '6': 2,
+            '7': 1,
+            '8': 1,
+            '9': 1,
+            '10': 1,
+            '11': 1,
+            '12': 1,
+            '13': 4,
+            '14': 4,
+            '15': 4,
+            '16': 4
+        };
+        const matches = (gamesRes?.games || []).map(game => {
+            const homeDetails = teamsMap.get(String(game.home_team_id)) || {};
+            const awayDetails = teamsMap.get(String(game.away_team_id)) || {};
+            let localDateStr = game.local_date;
+            let brtDateStr = localDateStr;
+            if (localDateStr) {
+                try {
+                    const parts = localDateStr.split(' ');
+                    const dateParts = parts[0].split('/');
+                    const timeParts = parts[1].split(':');
+                    const year = parseInt(dateParts[2]);
+                    const month = parseInt(dateParts[0]) - 1;
+                    const day = parseInt(dateParts[1]);
+                    const hour = parseInt(timeParts[0]);
+                    const minute = parseInt(timeParts[1]);
+                    const dt = new Date(Date.UTC(year, month, day, hour, minute));
+                    const shift = offsetHours[String(game.stadium_id)] || 0;
+                    dt.setUTCHours(dt.getUTCHours() + shift);
+                    const pad = (n) => String(n).padStart(2, '0');
+                    brtDateStr = `${pad(dt.getUTCDate())}/${pad(dt.getUTCMonth() + 1)}/${dt.getUTCFullYear()} ${pad(dt.getUTCHours())}:${pad(dt.getUTCMinutes())}`;
+                } catch (e) {
+                }
+            }
+            return {
+                id: game.id,
+                home_team: game.home_team_name_en || homeDetails.name_en || 'Unknown',
+                home_flag: homeDetails.flag || '',
+                home_score: game.home_score !== 'null' && game.home_score !== null ? parseInt(game.home_score) : null,
+                away_team: game.away_team_name_en || awayDetails.name_en || 'Unknown',
+                away_flag: awayDetails.flag || '',
+                away_score: game.away_score !== 'null' && game.away_score !== null ? parseInt(game.away_score) : null,
+                group: game.group,
+                matchday: game.matchday,
+                local_date: brtDateStr,
+                stadium_id: game.stadium_id,
+                finished: game.finished === 'TRUE',
+                time_elapsed: game.time_elapsed,
+                type: game.type
+            };
+        });
+        res.json({ success: true, matches });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.use((req, res) => {
     res.status(404).json({ error: 'Rota não encontrada' });
 });
